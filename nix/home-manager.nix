@@ -116,7 +116,11 @@ let
 
   backupHome = pkgs.writeShellApplication {
     name = "backup-home";
-    runtimeInputs = [ pkgs.restic pkgs.rclone pkgs.coreutils ];
+    # gnupg covers the typical passwordCommand surface (passveil, pass,
+    # plain `gpg --decrypt`); anything beyond that the user can extend
+    # via cfg.extraRuntimeInputs.
+    runtimeInputs = [ pkgs.restic pkgs.rclone pkgs.coreutils pkgs.gnupg ]
+      ++ cfg.extraRuntimeInputs;
     text = ''
       export RESTIC_REPOSITORY=${lib.escapeShellArg cfg.repo}
       export RESTIC_PASSWORD_COMMAND=${lib.escapeShellArg cfg.passwordCommand}
@@ -207,6 +211,17 @@ in
       '';
     };
 
+    extraRuntimeInputs = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
+      example = lib.literalExpression "[ pkgs.age pkgs.passveil ]";
+      description = ''
+        Extra packages prepended to the wrapper script's PATH. Useful
+        when the configured `passwordCommand` needs tools beyond the
+        default set (restic, rclone, coreutils, gnupg).
+      '';
+    };
+
     schedule = {
       hour = lib.mkOption {
         type = lib.types.ints.between 0 23;
@@ -275,10 +290,10 @@ in
             "HOME=${homeDir}"
             "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
           ];
-          # StandardOutput/StandardError default to "journal" so the run is
-          # visible via `journalctl -u backup-home.service`. The script
-          # additionally tees to ~/.local/log/backup-home-<ts>.log for a
-          # human-friendly per-run file.
+          # Explicit "journal" — systeml only enables stdio capture for
+          # units that say so by name (no implicit default).
+          StandardOutput = "journal";
+          StandardError  = "journal";
         };
       };
       systemd.user.timers.backup-home = {
