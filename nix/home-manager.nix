@@ -267,8 +267,10 @@ in
         Service = {
           Type = "oneshot";
           ExecStart = "${backupHome}/bin/backup-home";
-          StandardOutput = "append:${homeDir}/.local/log/backup-home.stdout.log";
-          StandardError  = "append:${homeDir}/.local/log/backup-home.stderr.log";
+          # StandardOutput/StandardError default to "journal" so the run is
+          # visible via `journalctl -u backup-home.service`. The script
+          # additionally tees to ~/.local/log/backup-home-<ts>.log for a
+          # human-friendly per-run file.
         };
       };
       systemd.user.timers.backup-home = {
