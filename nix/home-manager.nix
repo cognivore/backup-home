@@ -267,6 +267,14 @@ in
         Service = {
           Type = "oneshot";
           ExecStart = "${backupHome}/bin/backup-home";
+          # systeml on macOS inherits launchd's minimal env. Set HOME so
+          # rclone can find ~/.config/rclone/rclone.conf, and a base PATH
+          # so child processes (rclone shells out to `sh` for user-info
+          # lookup) can resolve system utilities.
+          Environment = [
+            "HOME=${homeDir}"
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+          ];
           # StandardOutput/StandardError default to "journal" so the run is
           # visible via `journalctl -u backup-home.service`. The script
           # additionally tees to ~/.local/log/backup-home-<ts>.log for a
