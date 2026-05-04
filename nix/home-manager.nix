@@ -46,6 +46,13 @@ let
     ${homeDir}/Library/Developer
     ${homeDir}/Library/Containers/com.utmapp.UTM
     ${homeDir}/Library/Containers/com.docker.docker
+
+    # Apple-shipped sandboxed apps. Their container directories are
+    # FDA-locked at the directory level (Mail, Messages, Notes, Safari,
+    # Maps, Home, VoiceMemos, …). The data is iCloud-synced or regenerable
+    # — restoring from a restic snapshot of these would be incomplete
+    # anyway. Exclude the whole namespace.
+    ${homeDir}/Library/Containers/com.apple.*
     ${homeDir}/Library/Application Support/Steam
     ${homeDir}/Library/Application Support/Claude
     ${homeDir}/Library/Application Support/Google
