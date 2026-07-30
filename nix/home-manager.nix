@@ -1,6 +1,14 @@
-# home-manager module: a daily restic backup of $HOME, with sensible
-# excludes for macOS junk (caches, Library/Containers, package manager
-# state, build artefacts, etc.).
+# home-manager module: a daily restic backup of $HOME with retrieval
+# verification and optional replica repositories, plus sensible excludes
+# for macOS junk (caches, Library/Containers, package manager state,
+# build artefacts, etc.).
+#
+# The operational program is ../backup-home.rs, a rust-script. This module
+# is only declarative glue: it generates the exclude file, substitutes the
+# serialized configuration into the Rust source, pins the rust-script
+# interpreter, compiles a small C exec-wrapper that fixes PATH and the
+# darwin toolchain environment (same pattern as wallstats), and wires up
+# the scheduler.
 #
 # Two scheduling backends, picked automatically:
 #
@@ -19,6 +27,7 @@
 #     repo = "rclone:gdrive:backups/myhost";
 #     passwordCommand = "${pkgs.passveil}/bin/passveil show restic/backup";
 #     # schedule.hour = 14; schedule.minute = 0;  # defaults
+#     # replicaRepos = [ "sftp:user@host:backups/myhost" ];
 #   };
 
 { config, lib, pkgs, ... }:
@@ -173,55 +182,111 @@ let
     ${lib.concatStringsSep "\n" cfg.extraExcludes}
   '');
 
-  backupHome = pkgs.writeShellApplication {
-    name = "backup-home";
-    # gnupg covers the typical passwordCommand surface (passveil, pass,
-    # plain `gpg --decrypt`); anything beyond that the user can extend
-    # via cfg.extraRuntimeInputs.
-    runtimeInputs = [ pkgs.restic pkgs.rclone pkgs.coreutils pkgs.gnupg ]
-      ++ cfg.extraRuntimeInputs;
-    text = ''
-      export RESTIC_REPOSITORY=${lib.escapeShellArg cfg.repo}
-      export RESTIC_PASSWORD_COMMAND=${lib.escapeShellArg cfg.passwordCommand}
+  # PATH for the program and everything it spawns: rust-script's toolchain
+  # (cargo/rustc/cc compile the script on first run), restic and its
+  # transport helpers (rclone for rclone:, ssh for sftp:), gnupg for the
+  # typical passwordCommand surface (passveil, pass, `gpg --decrypt`).
+  runtimePath = lib.makeBinPath ([
+    pkgs.rust-script
+    pkgs.cargo
+    pkgs.rustc
+    pkgs.stdenv.cc
+    pkgs.stdenv.cc.bintools
+    pkgs.restic
+    pkgs.rclone
+    pkgs.openssh
+    pkgs.gnupg
+    pkgs.coreutils
+    pkgs.bash
+  ] ++ cfg.extraRuntimeInputs);
 
-      LOG="${homeDir}/.local/log/backup-home-$(date +%Y-%m-%d_%H%M%S).log"
-      mkdir -p "$(dirname "$LOG")"
-
-      echo "=== backup-home started: $(date) ===" | tee -a "$LOG"
-      echo "    repo: $RESTIC_REPOSITORY" | tee -a "$LOG"
-
-      # Preflight: verify password access before doing anything.
-      if ! eval "$RESTIC_PASSWORD_COMMAND" >/dev/null 2>&1; then
-        echo "FATAL: cannot resolve restic password via configured passwordCommand." | tee -a "$LOG" >&2
-        exit 1
-      fi
-
-      # Bail if another backup is already running.
-      if restic list locks --no-lock 2>/dev/null | grep -q .; then
-        echo "FATAL: restic repo is locked — another backup is still running." | tee -a "$LOG" >&2
-        exit 1
-      fi
-
-      # Auto-init on first run.
-      if ! restic snapshots --quiet >/dev/null 2>&1; then
-        echo "Initializing restic repository..." | tee -a "$LOG"
-        restic init 2>&1 | tee -a "$LOG"
-      fi
-
-      restic backup ${lib.escapeShellArg "${homeDir}/"} \
-        --exclude-file ${lib.escapeShellArg "${excludeFile}"} \
-        --verbose=2 2>&1 | tee -a "$LOG"
-
-      restic forget \
-        --keep-daily ${toString cfg.retention.daily} \
-        --keep-weekly ${toString cfg.retention.weekly} \
-        --keep-monthly ${toString cfg.retention.monthly} \
-        --keep-yearly ${toString cfg.retention.yearly} \
-        --prune 2>&1 | tee -a "$LOG"
-
-      echo "=== backup-home complete: $(date) ===" | tee -a "$LOG"
-    '';
+  configJson = builtins.toJSON {
+    home = homeDir;
+    repo = cfg.repo;
+    password_command = cfg.passwordCommand;
+    exclude_file = "${excludeFile}";
+    replica_repos = cfg.replicaRepos;
+    retention = {
+      inherit (cfg.retention) daily weekly monthly yearly;
+    };
+    verification = {
+      enable = cfg.verification.enable;
+      sample_size = cfg.verification.sampleSize;
+    };
+    log_dir = "${homeDir}/.local/log";
+    restic_bin = "${pkgs.restic}/bin/restic";
   };
+
+  # The operational program: generic rust-script source with one embedded
+  # config placeholder. Nix substitutes the serialized configuration and
+  # pins the interpreter, so the store file is directly executable and all
+  # operational behavior stays in Rust — no wrapper shell script.
+  backupHomeScript = pkgs.writeTextFile {
+    name = "backup-home.rs";
+    executable = true;
+    text = builtins.replaceStrings
+      [ "#!/usr/bin/env rust-script" "@BACKUP_HOME_CONFIG_JSON@" ]
+      [ "#!${pkgs.rust-script}/bin/rust-script" configJson ]
+      (builtins.readFile ../backup-home.rs);
+  };
+
+  # Compiled exec-wrapper (no shell): pins PATH plus the darwin toolchain
+  # environment cargo/rustc need when rust-script compiles the program on
+  # first run, then execs the script. Same pattern as wallstats' rust-script
+  # runtime. Works identically from the scheduler and an interactive shell.
+  wrapperSource = pkgs.writeText "backup-home-wrapper.c" ''
+    #include <errno.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <unistd.h>
+
+    struct environment_entry {
+        const char *name;
+        const char *value;
+    };
+
+    int main(int argc, char **argv) {
+        (void)argc;
+
+        static const char script[] = "${backupHomeScript}";
+        static const struct environment_entry environment[] = {
+            { "PATH", "${runtimePath}:/usr/bin:/bin:/usr/sbin:/sbin" },
+            { "SHELL", "${pkgs.bash}/bin/bash" },
+            { "CARGO", "${pkgs.cargo}/bin/cargo" },
+            { "RUSTC", "${pkgs.rustc}/bin/rustc" },
+            { "RUSTDOC", "${pkgs.rustc}/bin/rustdoc" },
+            { "CC", "${pkgs.stdenv.cc}/bin/cc" },
+            { "CXX", "${pkgs.stdenv.cc}/bin/c++" },
+            { "AR", "${pkgs.stdenv.cc.bintools}/bin/ar" },
+            { "RANLIB", "${pkgs.stdenv.cc.bintools}/bin/ranlib" },
+            { "LIBRARY_PATH", "${pkgs.libiconv}/lib" },
+            { "NIX_LDFLAGS", "-L${pkgs.libiconv}/lib" },
+            { "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", "${pkgs.stdenv.cc}/bin/cc" },
+            { "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER", "${pkgs.stdenv.cc}/bin/cc" },
+            { "SSL_CERT_FILE", "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" },
+            { "CARGO_HTTP_CAINFO", "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" },
+        };
+
+        for (size_t index = 0; index < sizeof(environment) / sizeof(environment[0]); index++) {
+            if (setenv(environment[index].name, environment[index].value, 1) != 0) {
+                fprintf(stderr, "backup-home: cannot set %s: %s\n",
+                        environment[index].name, strerror(errno));
+                return 126;
+            }
+        }
+
+        execv(script, argv);
+        const int error = errno;
+        fprintf(stderr, "backup-home: cannot execute %s: %s\n", script, strerror(error));
+        return error == ENOENT ? 127 : 126;
+    }
+  '';
+
+  backupHome = pkgs.runCommandCC "backup-home" { } ''
+    mkdir -p "$out/bin"
+    "$CC" -O2 -Wall -Wextra -Werror ${wrapperSource} -o "$out/bin/backup-home"
+  '';
 
   useSysteml =
     if cfg.useSysteml == null
@@ -254,10 +319,56 @@ in
       example = lib.literalExpression ''"''${pkgs.passveil}/bin/passveil show restic/backup"'';
       description = ''
         Shell command that prints the restic repository password to
-        stdout. Set as `RESTIC_PASSWORD_COMMAND`. Use a secret-store
-        wrapper (passveil, pass, age, …) — never an inline plaintext
-        password.
+        stdout. Set as `RESTIC_PASSWORD_COMMAND`; also used for every
+        replica repository. Use a secret-store wrapper (passveil, pass,
+        age, …) — never an inline plaintext password.
       '';
+    };
+
+    replicaRepos = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "sftp:zh6433@zh6433.rsync.net:backups/myhost" ];
+      description = ''
+        Restic repository URLs the new snapshot is copied to on every run
+        (`restic copy` — no second filesystem scan). Replicas share the
+        primary's passwordCommand, are auto-initialized with
+        `--copy-chunker-params` on first contact (bootstrapping all
+        retained home snapshots), and get the same retention policy.
+        `sftp:` replicas must be reachable with key-only (BatchMode) SSH,
+        or every scheduled run will hang or fail.
+      '';
+    };
+
+    verification = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Retrieval verification around every run: uniformly sample
+          `sampleSize` regular files from the latest snapshot and
+          restore them with `--verify` before the backup; re-restore the
+          same sample after backup + prune and compare SHA-256/size
+          manifests byte-for-byte; restore a fresh disjoint sample from
+          the new snapshot; and run the equivalent check against every
+          replica. A failed pre-check never blocks the backup itself —
+          it is reported through the final exit status.
+        '';
+      };
+      sampleSize = lib.mkOption {
+        type = lib.types.addCheck lib.types.int (n: n >= 300) // {
+          description = "integer of at least 300";
+        };
+        default = 300;
+        description = ''
+          Files per verification sample. Sampling 300 files without
+          replacement gives at least `1 - 0.99^300 = 95.1%` probability
+          of hitting a bad file when 1% or more of the snapshot's
+          regular files are unretrievable. If the snapshot has fewer
+          eligible files, all of them are tested. Values below 300 are
+          rejected.
+        '';
+      };
     };
 
     extraExcludes = lib.mkOption {
@@ -275,9 +386,10 @@ in
       default = [ ];
       example = lib.literalExpression "[ pkgs.age pkgs.passveil ]";
       description = ''
-        Extra packages prepended to the wrapper script's PATH. Useful
+        Extra packages prepended to the program's pinned PATH. Useful
         when the configured `passwordCommand` needs tools beyond the
-        default set (restic, rclone, coreutils, gnupg).
+        default set (restic, rclone, openssh, coreutils, gnupg, and the
+        rust-script toolchain).
       '';
     };
 
@@ -318,7 +430,10 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       readOnly = true;
-      description = "The wrapped `backup-home` shell application as a derivation.";
+      description = ''
+        The `backup-home` program as a derivation: the compiled
+        exec-wrapper around the configured rust-script.
+      '';
     };
   };
 
@@ -336,15 +451,15 @@ in
     (lib.mkIf useSysteml {
       systemd.user.services.backup-home = {
         Unit = {
-          Description = "Daily home directory backup (restic + rclone)";
+          Description = "Daily home directory backup (restic + rclone, verified)";
         };
         Service = {
           Type = "oneshot";
           ExecStart = "${backupHome}/bin/backup-home";
           # systeml on macOS inherits launchd's minimal env. Set HOME so
-          # rclone can find ~/.config/rclone/rclone.conf, and a base PATH
-          # so child processes (rclone shells out to `sh` for user-info
-          # lookup) can resolve system utilities.
+          # rclone can find ~/.config/rclone/rclone.conf and rust-script
+          # can keep its build cache; the wrapper pins PATH itself, the
+          # base PATH here only covers pre-exec resolution.
           Environment = [
             "HOME=${homeDir}"
             "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
