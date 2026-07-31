@@ -676,7 +676,27 @@ fn sync_replica(
         args.push("--path".to_string());
         args.push(home.to_string());
     }
-    run_restic_logged(cfg, log, replica, &args)?;
+    // Multi-hour copies over two cloud backends die to transient transport
+    // failures (observed: the sftp ssh session timing out 15h into the
+    // rsync.net bootstrap). Re-running `restic copy` is a cheap resume —
+    // blobs already in the destination index are skipped — so retry with a
+    // fresh connection instead of failing the whole stage.
+    const COPY_ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match run_restic_logged(cfg, log, replica, &args) {
+            Ok(()) => break,
+            Err(e) if attempt < COPY_ATTEMPTS => {
+                log.line(&format!(
+                    "replica copy attempt {attempt}/{COPY_ATTEMPTS} failed ({e:#}); \
+                     retrying in 60s — already-copied data is skipped on resume"
+                ));
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            Err(e) => return Err(e),
+        }
+    }
     apply_retention(cfg, log, replica)
 }
 
