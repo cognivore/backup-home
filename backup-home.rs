@@ -710,6 +710,13 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
     // -- fatal preflight ----------------------------------------------------
     check_password(cfg).context("cannot resolve restic password via configured passwordCommand")?;
 
+    // Drop stale locks first: a lock whose owning process is dead would
+    // otherwise fail every future run until someone notices (this silently
+    // killed every daily run 2026-07-13..27). `restic unlock` never touches
+    // locks held by live processes, so a genuinely running backup still
+    // trips the check below. Errors ignored — the repo may not exist yet.
+    let _ = run_restic_capture(cfg, log, &cfg.repo, &strs(&["unlock"]));
+
     // Bail if another backup is already running. A failing lock listing means
     // the repo may simply not exist yet — auto-init below handles that.
     if let Ok(out) = run_restic_capture(cfg, log, &cfg.repo, &strs(&["list", "locks", "--no-lock"])) {
