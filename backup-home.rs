@@ -631,6 +631,15 @@ fn sync_replica(
     new_snapshot_id: Option<&str>,
 ) -> Result<()> {
     let home = cfg.home.trim_end_matches('/');
+
+    // The same stale-lock hygiene the primary gets in preflight. A run
+    // interrupted mid-prune leaves a dead lock here, and every later
+    // `forget --prune` on this replica fails until someone unlocks by hand
+    // (observed 2026-08-01..02 on rsync.net, three stale locks deep).
+    // `restic unlock` never touches locks held by live processes. Errors
+    // ignored — the repo may not exist yet.
+    let _ = run_restic_capture(cfg, log, replica, &strs(&["unlock"]));
+
     let existing = match snapshots(cfg, log, replica) {
         Ok(list) => Some(list),
         Err(_) => {
