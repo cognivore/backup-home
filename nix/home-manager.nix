@@ -35,6 +35,7 @@
 let
   cfg = config.services.backup-home;
   homeDir = config.home.homeDirectory;
+  logDir = "${homeDir}/.local/log";
 
   excludeFile = pkgs.writeText "restic-home-excludes" (''
     # macOS junk
@@ -162,6 +163,12 @@ let
     # IDE data
     ${homeDir}/.cursor-server
 
+    # This program's own --verbose=2 transcripts: ~220 MB per run, a fresh
+    # file every day, and worthless in a restore. The JSON manifests next to
+    # them are 70 KB and are kept — they are the evidence for what each run
+    # verified.
+    ${logDir}/backup-home-*.log
+
     # Build artifacts (match anywhere in tree)
     node_modules
     target/debug
@@ -213,7 +220,9 @@ let
       enable = cfg.verification.enable;
       sample_size = cfg.verification.sampleSize;
     };
-    log_dir = "${homeDir}/.local/log";
+    log_dir = logDir;
+    log_retention_days = cfg.logRetentionDays;
+    status_file = cfg.statusFile;
     restic_bin = "${pkgs.restic}/bin/restic";
   };
 
@@ -390,6 +399,29 @@ in
         when the configured `passwordCommand` needs tools beyond the
         default set (restic, rclone, openssh, coreutils, gnupg, and the
         rust-script toolchain).
+      '';
+    };
+
+    logRetentionDays = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 30;
+      description = ''
+        Delete `backup-home-*` logs and manifests older than this many days
+        at the start of every run. `--verbose=2` writes roughly one line per
+        file in `$HOME`, so an unpruned log directory grows by a couple of
+        hundred megabytes a day. 0 keeps everything forever.
+      '';
+    };
+
+    statusFile = lib.mkOption {
+      type = lib.types.str;
+      default = "${homeDir}/.local/state/backup-home/status.json";
+      description = ''
+        Small JSON document rewritten at the start and end of every run,
+        holding the backup and recovery outcomes separately along with the
+        timestamp each half last succeeded. Meant for desktop monitors, which
+        would otherwise have to grep a multi-hundred-megabyte log. Set to the
+        empty string to disable.
       '';
     };
 

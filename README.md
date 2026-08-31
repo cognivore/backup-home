@@ -56,6 +56,15 @@ Force one or the other with `services.backup-home.useSysteml = true | false`.
     # Optional: time of day. Defaults to 14:00.
     schedule = { hour = 14; minute = 0; };
 
+    # Optional: drop run logs and manifests older than this at the start of
+    # every run. `--verbose=2` writes one line per file, so an unpruned log
+    # directory grows by a couple of hundred megabytes a day. 0 disables.
+    logRetentionDays = 30;
+
+    # Optional: small JSON document rewritten at the start and end of every
+    # run, for desktop monitors. Empty string disables it.
+    statusFile = "${config.home.homeDirectory}/.local/state/backup-home/status.json";
+
     # Optional: retention policy passed to `restic forget`.
     retention = { daily = 7; weekly = 4; monthly = 12; yearly = 3; };
   };
@@ -72,6 +81,45 @@ Force one or the other with `services.backup-home.useSysteml = true | false`.
 4. `restic copy` the new snapshot to every replica; apply the same retention there. (Copied snapshots get new IDs — the program resolves them via the `original` field.)
 5. Post-backup: restore the *same* pre-backup sample from the *same* old snapshot again and compare manifests byte-for-byte; restore a fresh disjoint sample from the new snapshot; run the equivalent retrieval check against every replica.
 6. A failed pre-check never blocks the backup. All stage failures are collected and the run exits nonzero if any stage failed — after all useful work was attempted.
+7. Rewrite `statusFile` and delete run logs older than `logRetentionDays`.
+
+## Backup vs. recovery
+
+Stage failures are classified into two independent halves, because they answer
+different questions and fail for different reasons:
+
+- **backup** — `backup`, `snapshot listing`, `prune`, `replica sync`. Did we
+  store it?
+- **recovery** — `pre-backup *`, `post-backup *`, `new-snapshot *`,
+  `replica retrieval *`. Can we get it back?
+
+A snapshot can save perfectly while the replica prune trips over a stale lock,
+and a repository can keep accepting writes long after it stopped being
+readable. Both halves are reported separately in the log:
+
+```text
+=== recovery: OK — 4 check(s) passed, 0 failed, 1200 file(s) restored and compared ===
+=== backup-home complete: 2026-08-31 15:48:24 +0100 (all stages OK) ===
+```
+
+and in `statusFile`:
+
+```json
+{
+  "schema": 1,
+  "state": "finished",
+  "started_at": "2026-08-31 15:00:02 +0100",
+  "backup":   { "status": "ok", "snapshot": "093147cd", "last_ok_unix": 1756652904 },
+  "recovery": { "status": "ok", "checks_ok": 4, "checks_failed": 0,
+                "files_verified": 1200, "last_ok_unix": 1756652904 }
+}
+```
+
+`status` is one of `running`, `ok`, `failed`, `untested` (verification was on
+but nothing could be checked — a first run, say) or `disabled`. `last_ok_*` is
+carried forward across runs that did not succeed, so a monitor can answer "how
+long since this last actually worked?" rather than only "did today's run
+pass?".
 
 ## What gets backed up
 
@@ -89,7 +137,7 @@ Add to this list with `services.backup-home.extraExcludes`. Read the [home-manag
 
 ## Logs
 
-- Per-run log: `~/.local/log/backup-home-YYYY-MM-DD_HHMMSS.log`
+- Per-run log: `~/.local/log/backup-home-YYYY-MM-DD_HHMMSS.log` (pruned after `logRetentionDays`, and excluded from the backup itself)
 - Sample manifests: `~/.local/log/backup-home-YYYY-MM-DD_HHMMSS-{pre-old,post-old,post-new}-snapshot.json` and `...-replica-N.json`
 - Scheduler output is retained too: systeml journal, or `~/.local/log/backup-home-launchd.{stdout,stderr}.log` under launchd.
 

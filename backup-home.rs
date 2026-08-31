@@ -21,6 +21,13 @@
 //!      snapshot; run the equivalent retrieval check against every replica
 //!   6. aggregate stage failures — a failed pre-check never blocks the
 //!      backup, but any failed stage makes the whole run exit nonzero
+//!   7. write `status_file` (a small JSON document) and drop run logs older
+//!      than `log_retention_days`
+//!
+//! Failures are classified as *backup* (writing the snapshot, pruning,
+//! replicating) or *recovery* (reading data back out and verifying it), so a
+//! monitor can answer the two questions separately: "did we store it?" and
+//! "can we get it back?".
 //!
 //! ```cargo
 //! [dependencies]
@@ -44,6 +51,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 // Replaced by the Nix module with builtins.toJSON of the module config. The
 // r## guard means the JSON may freely contain quotes and backslashes.
@@ -77,6 +85,17 @@ struct Config {
     retention: Retention,
     verification: Verification,
     log_dir: String,
+    // Delete `backup-home-*` logs and manifests older than this many days at
+    // the start of every run. 0 keeps them forever — which is how
+    // ~/.local/log reached 15 GB of --verbose=2 transcripts before this
+    // existed. The current run's own files are never candidates.
+    #[serde(default = "default_log_retention_days")]
+    log_retention_days: u32,
+    // Small JSON document rewritten at the start and end of every run.
+    // Empty disables it. Consumed by desktop monitors (wallstats) that want
+    // structured state instead of grepping a 200 MB log.
+    #[serde(default)]
+    status_file: String,
     #[serde(default = "default_restic_bin")]
     restic_bin: String,
     // Extra args appended to `restic backup`. Unset in production; the e2e
@@ -88,6 +107,10 @@ struct Config {
 
 fn default_restic_bin() -> String {
     "restic".to_string()
+}
+
+fn default_log_retention_days() -> u32 {
+    30
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +627,19 @@ fn run_primary_backup(cfg: &Config, log: &Logger) -> Result<()> {
 }
 
 fn apply_retention(cfg: &Config, log: &Logger, repo: &str) -> Result<()> {
+    // `forget --prune` needs an exclusive lock, and the stage that ran
+    // immediately before this one — `backup` on the primary, `copy` on a
+    // replica — may have left one behind: a restic process killed mid-flight
+    // never removes its lock, and on `rclone:gdrive:` a lock released
+    // seconds ago can still be listed while Drive catches up. Either way the
+    // prune fails against a lock owned by a process that is already gone.
+    //
+    // Preflight and `sync_replica` both unlock before they start work, but
+    // neither helps against a lock created *during* the run, so drop stale
+    // locks here too. `restic unlock` never touches locks held by a live
+    // process, so a genuinely concurrent backup still blocks this prune.
+    let _ = run_restic_capture(cfg, log, repo, &strs(&["unlock"]));
+
     let r = &cfg.retention;
     let args = vec![
         "forget".to_string(),
@@ -701,7 +737,12 @@ fn sync_replica(
                     "replica copy attempt {attempt}/{COPY_ATTEMPTS} failed ({e:#}); \
                      retrying in 60s — already-copied data is skipped on resume"
                 ));
-                std::thread::sleep(std::time::Duration::from_secs(60));
+                std::thread::sleep(Duration::from_secs(60));
+                // The attempt that just died left its lock behind. A later
+                // `copy` tolerates it, but the `forget --prune` at the end of
+                // this function does not — clear it before the retry rather
+                // than failing the retention stage on our own debris.
+                let _ = run_restic_capture(cfg, log, replica, &strs(&["unlock"]));
             }
             Err(e) => return Err(e),
         }
@@ -710,17 +751,234 @@ fn sync_replica(
 }
 
 // ---------------------------------------------------------------------------
-// The run itself
+// Status file and log retention.
 
-fn record(failures: &mut Vec<String>, log: &Logger, stage: &str, detail: &str) {
-    let msg = format!("FAILURE [{stage}]: {detail}");
-    log.line(&msg);
-    failures.push(msg);
+/// One half of a run's outcome. `backup` answers "did we store it?";
+/// `recovery` answers "can we get it back?". They fail independently — a
+/// snapshot can save perfectly while the replica prune trips over a lock,
+/// and a repository can accept writes long after it stopped being readable.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct HalfStatus {
+    /// `running` | `ok` | `failed` | `untested` | `disabled`.
+    status: String,
+    /// When this half last succeeded, carried forward across runs that did
+    /// not. A reader wants "how long since this actually worked?", not just
+    /// "did today's run pass?".
+    #[serde(default)]
+    last_ok_at: Option<String>,
+    #[serde(default)]
+    last_ok_unix: Option<i64>,
+    /// Newest snapshot written (backup half only).
+    #[serde(default)]
+    snapshot: Option<String>,
+    /// Retrieval checks that passed and failed this run (recovery half only).
+    #[serde(default)]
+    checks_ok: u32,
+    #[serde(default)]
+    checks_failed: u32,
+    /// Files restored, hashed and compared this run (recovery half only).
+    #[serde(default)]
+    files_verified: u64,
+    #[serde(default)]
+    failures: Vec<String>,
 }
 
-fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
-    let mut failures: Vec<String> = Vec::new();
+impl HalfStatus {
+    fn running(previous: Option<&HalfStatus>) -> HalfStatus {
+        HalfStatus {
+            status: "running".to_string(),
+            last_ok_at: previous.and_then(|p| p.last_ok_at.clone()),
+            last_ok_unix: previous.and_then(|p| p.last_ok_unix),
+            ..HalfStatus::default()
+        }
+    }
+
+    /// Stamp `last_ok_*` when this half succeeded; otherwise keep whatever
+    /// the previous run left there.
+    fn finish(&mut self, status: &str, now: chrono::DateTime<chrono::Local>) {
+        self.status = status.to_string();
+        if status == "ok" {
+            self.last_ok_at = Some(now.format("%Y-%m-%d %H:%M:%S %z").to_string());
+            self.last_ok_unix = Some(now.timestamp());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Status {
+    schema: u32,
+    /// `running` | `finished`. A `running` status whose file has not been
+    /// touched for a long time is a run that was killed.
+    state: String,
+    started_at: String,
+    started_unix: i64,
+    #[serde(default)]
+    finished_at: Option<String>,
+    #[serde(default)]
+    finished_unix: Option<i64>,
+    repo: String,
+    #[serde(default)]
+    replica_repos: Vec<String>,
+    backup: HalfStatus,
+    recovery: HalfStatus,
+}
+
+fn read_status(cfg: &Config) -> Option<Status> {
+    if cfg.status_file.is_empty() {
+        return None;
+    }
+    let text = fs::read_to_string(&cfg.status_file).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Rewrite the status file atomically. Never fatal: a monitor going stale
+/// must not be able to fail a backup.
+fn write_status(cfg: &Config, log: &Logger, status: &Status) {
+    if cfg.status_file.is_empty() {
+        return;
+    }
+    let path = Path::new(&cfg.status_file);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            log.line(&format!("warning: cannot create status directory {}: {e}", parent.display()));
+            return;
+        }
+    }
+    let json = match serde_json::to_string_pretty(status) {
+        Ok(j) => j,
+        Err(e) => {
+            log.line(&format!("warning: cannot serialize status: {e}"));
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = fs::write(&tmp, json.as_bytes() as &[u8]).and_then(|()| fs::rename(&tmp, path)) {
+        log.line(&format!("warning: cannot write status file {}: {e}", path.display()));
+    }
+}
+
+/// True for files this program produced for a past run: `backup-home-` plus
+/// a timestamp. Deliberately excludes the scheduler's own append-only
+/// `backup-home-launchd.{stdout,stderr}.log`, which launchd holds open.
+fn is_run_artifact(name: &str) -> bool {
+    name.strip_prefix("backup-home-")
+        .and_then(|rest| rest.as_bytes().first())
+        .is_some_and(u8::is_ascii_digit)
+}
+
+/// Delete run logs and manifests older than `log_retention_days`. With
+/// `--verbose=2` every run writes one line per file — a ~220 MB log per day
+/// that nothing else ever removes.
+fn prune_logs(cfg: &Config, log: &Logger) {
+    if cfg.log_retention_days == 0 {
+        return;
+    }
+    let keep = Duration::from_secs(u64::from(cfg.log_retention_days) * 24 * 60 * 60);
+    let Some(cutoff) = SystemTime::now().checked_sub(keep) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&cfg.log_dir) else {
+        return;
+    };
+    let mut removed = 0u32;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_run_artifact(&name) {
+            continue;
+        }
+        let path = entry.path();
+        // Never touch the run that is happening right now.
+        if path.starts_with(&log.prefix) || path == log.log_path {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.modified().is_ok_and(|m| m < cutoff) && fs::remove_file(&path).is_ok() {
+            removed += 1;
+            bytes += meta.len();
+        }
+    }
+    if removed > 0 {
+        log.line(&format!(
+            "pruned {removed} log file(s) older than {} days ({:.1} GiB)",
+            cfg.log_retention_days,
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The run itself
+
+/// Stage failures, split into the two halves a monitor reports separately.
+#[derive(Debug, Default)]
+struct Outcome {
+    backup: Vec<String>,
+    recovery: Vec<String>,
+}
+
+impl Outcome {
+    fn all(&self) -> Vec<String> {
+        self.backup.iter().chain(self.recovery.iter()).cloned().collect()
+    }
+
+    fn len(&self) -> usize {
+        self.backup.len() + self.recovery.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Stages that read data back out of a repository and check it against a
+/// manifest. Everything else — writing the snapshot, pruning, replicating —
+/// is the backup half. `every_stage_is_classified` pins this to the stage
+/// names `run` actually passes to `record`.
+fn is_recovery_stage(stage: &str) -> bool {
+    const RECOVERY_PREFIXES: [&str; 4] =
+        ["pre-backup", "post-backup", "new-snapshot", "replica retrieval"];
+    RECOVERY_PREFIXES.iter().any(|prefix| stage.starts_with(prefix))
+}
+
+fn record(out: &mut Outcome, log: &Logger, stage: &str, detail: &str) {
+    let msg = format!("FAILURE [{stage}]: {detail}");
+    log.line(&msg);
+    if is_recovery_stage(stage) {
+        out.recovery.push(msg);
+    } else {
+        out.backup.push(msg);
+    }
+}
+
+fn run(cfg: &Config, log: &Logger) -> Result<Outcome> {
+    let mut failures = Outcome::default();
+    // Retrieval checks that passed, and files restored+compared by them.
+    let mut checks_ok: u32 = 0;
+    let mut files_verified: u64 = 0;
     let start = chrono::Local::now();
+
+    // Carry `last_ok_*` forward from the previous run before overwriting it.
+    let previous = read_status(cfg);
+    let mut status = Status {
+        schema: 1,
+        state: "running".to_string(),
+        started_at: start.format("%Y-%m-%d %H:%M:%S %z").to_string(),
+        started_unix: start.timestamp(),
+        finished_at: None,
+        finished_unix: None,
+        repo: cfg.repo.clone(),
+        replica_repos: cfg.replica_repos.clone(),
+        backup: HalfStatus::running(previous.as_ref().map(|p| &p.backup)),
+        recovery: HalfStatus::running(previous.as_ref().map(|p| &p.recovery)),
+    };
+    write_status(cfg, log, &status);
+
     log.line(&format!("=== backup-home started: {} ===", start.format("%Y-%m-%d %H:%M:%S %z")));
     log.line(&format!("    primary repo: {}", cfg.repo));
     for r in &cfg.replica_repos {
@@ -735,6 +993,8 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
         }
     ));
     log.line(&format!("    log file: {}", log.log_path.display()));
+
+    prune_logs(cfg, log);
 
     // -- fatal preflight ----------------------------------------------------
     check_password(cfg).context("cannot resolve restic password via configured passwordCommand")?;
@@ -785,6 +1045,8 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
                                 if let Err(e) = write_manifest(log, "pre-old-snapshot", &m) {
                                     record(&mut failures, log, "pre-backup manifest", &format!("{e:#}"));
                                 }
+                                checks_ok += 1;
+                                files_verified += m.len() as u64;
                                 manifest_a = Some(m);
                             }
                         }
@@ -830,6 +1092,7 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
     };
     if let Some(s) = &new_snapshot {
         log.line(&format!("new snapshot: {}", short_id(&s.id)));
+        status.backup.snapshot = Some(short_id(&s.id).to_string());
     }
 
     // -- retention on the primary -------------------------------------------
@@ -868,6 +1131,8 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
                             }
                             let diffs = manifest_diff(before, &after);
                             if diffs.is_empty() {
+                                checks_ok += 1;
+                                files_verified += after.len() as u64;
                                 log.line("original sample manifests match byte-for-byte");
                             } else {
                                 let shown = diffs.iter().take(10).cloned().collect::<Vec<_>>().join("; ");
@@ -908,6 +1173,8 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
                                 if let Err(e) = write_manifest(log, "post-new-snapshot", &m) {
                                     record(&mut failures, log, "new-snapshot manifest", &format!("{e:#}"));
                                 }
+                                checks_ok += 1;
+                                files_verified += m.len() as u64;
                                 manifest_b = Some(m);
                             }
                         }
@@ -937,6 +1204,8 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
                                     }
                                     let diffs = manifest_diff(expected, &m);
                                     if diffs.is_empty() {
+                                        checks_ok += 1;
+                                        files_verified += m.len() as u64;
                                         log.line("replica sample matches the primary manifest");
                                     } else {
                                         let shown =
@@ -961,6 +1230,28 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
 
     // -- summary --------------------------------------------------------------
     let end = chrono::Local::now();
+
+    // Recovery is only "ok" when something was actually read back and
+    // compared. A run with nothing to verify — verification off, or a first
+    // run with no earlier snapshot — is reported as untested rather than
+    // green, because nothing has proved this repository is readable.
+    let recovery_status = if !cfg.verification.enable {
+        "disabled"
+    } else if !failures.recovery.is_empty() {
+        "failed"
+    } else if checks_ok == 0 {
+        "untested"
+    } else {
+        "ok"
+    };
+    let backup_status = if failures.backup.is_empty() { "ok" } else { "failed" };
+
+    log.line(&format!(
+        "=== recovery: {} — {checks_ok} check(s) passed, {} failed, {files_verified} file(s) restored and compared ===",
+        recovery_status.to_uppercase(),
+        failures.recovery.len()
+    ));
+
     if failures.is_empty() {
         log.line(&format!(
             "=== backup-home complete: {} (all stages OK) ===",
@@ -972,10 +1263,23 @@ fn run(cfg: &Config, log: &Logger) -> Result<Vec<String>> {
             failures.len(),
             end.format("%Y-%m-%d %H:%M:%S %z")
         ));
-        for f in &failures {
+        for f in &failures.all() {
             log.line(&format!("    {f}"));
         }
     }
+
+    status.state = "finished".to_string();
+    status.finished_at = Some(end.format("%Y-%m-%d %H:%M:%S %z").to_string());
+    status.finished_unix = Some(end.timestamp());
+    status.backup.failures = failures.backup.clone();
+    status.backup.finish(backup_status, end);
+    status.recovery.checks_ok = checks_ok;
+    status.recovery.checks_failed = failures.recovery.len() as u32;
+    status.recovery.files_verified = files_verified;
+    status.recovery.failures = failures.recovery.clone();
+    status.recovery.finish(recovery_status, end);
+    write_status(cfg, log, &status);
+
     Ok(failures)
 }
 
@@ -1029,6 +1333,19 @@ fn real_main() -> i32 {
         Ok(_) => 1,
         Err(e) => {
             log.line(&format!("FATAL: {e:#}"));
+            // `run` bails before it can write its own summary, so the status
+            // file would otherwise stay "running" forever and read as a
+            // killed process rather than a refused one.
+            if let Some(mut status) = read_status(&cfg) {
+                let end = chrono::Local::now();
+                status.state = "finished".to_string();
+                status.finished_at = Some(end.format("%Y-%m-%d %H:%M:%S %z").to_string());
+                status.finished_unix = Some(end.timestamp());
+                status.backup.failures = vec![format!("FATAL: {e:#}")];
+                status.backup.finish("failed", end);
+                status.recovery.finish("untested", end);
+                write_status(&cfg, &log, &status);
+            }
             1
         }
     }
@@ -1216,12 +1533,186 @@ mod tests {
     fn failures_accumulate_with_stage_labels() {
         let dir = tempfile::TempDir::new().unwrap();
         let log = Logger::create(dir.path()).unwrap();
-        let mut failures = Vec::new();
+        let mut failures = Outcome::default();
         record(&mut failures, &log, "pre-backup restore", "boom");
         record(&mut failures, &log, "prune", "bang");
         assert_eq!(failures.len(), 2);
-        assert!(failures[0].contains("FAILURE [pre-backup restore]: boom"));
-        assert!(failures[1].contains("FAILURE [prune]: bang"));
+        assert_eq!(failures.recovery.len(), 1);
+        assert_eq!(failures.backup.len(), 1);
+        assert!(failures.recovery[0].contains("FAILURE [pre-backup restore]: boom"));
+        assert!(failures.backup[0].contains("FAILURE [prune]: bang"));
+        assert_eq!(failures.all().len(), 2);
+    }
+
+    /// Every stage name `run` passes to `record`, and which half it belongs
+    /// to. If a new stage is added without a decision here, the run's
+    /// recovery verdict silently misreports it — so this list is the
+    /// contract, checked against the source below.
+    const STAGES: [(&str, bool); 13] = [
+        ("pre-backup sample", true),
+        ("pre-backup restore", true),
+        ("pre-backup manifest", true),
+        ("post-backup original sample", true),
+        ("post-backup manifest", true),
+        ("new-snapshot sample", true),
+        ("new-snapshot restore", true),
+        ("new-snapshot manifest", true),
+        ("replica retrieval sftp:user@host:repo", true),
+        ("backup", false),
+        ("snapshot listing", false),
+        ("prune", false),
+        ("replica sync sftp:user@host:repo", false),
+    ];
+
+    #[test]
+    fn recovery_stages_are_classified_as_recovery() {
+        for (stage, is_recovery) in STAGES {
+            assert_eq!(
+                is_recovery_stage(stage),
+                is_recovery,
+                "stage {stage:?} classified wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn every_stage_is_classified() {
+        // The stage strings appear as literals in `run`; a new one that
+        // nobody classified would not be in STAGES.
+        let source = include_str!("backup-home.rs");
+        let body = source
+            .split("fn run(cfg: &Config, log: &Logger)")
+            .nth(1)
+            .expect("run() is in this file");
+        let body = body.split("// -- summary").next().unwrap();
+        for line in body.lines() {
+            let Some(rest) = line.split("record(&mut failures, log, ").nth(1) else {
+                continue;
+            };
+            // Only literal stage names; `&stage` and `&format!(..)` are the
+            // replica stages, already covered by STAGES.
+            let Some(stage) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                continue;
+            };
+            assert!(
+                STAGES.iter().any(|(known, _)| *known == stage),
+                "stage {stage:?} in run() is missing from STAGES"
+            );
+        }
+    }
+
+    // -- status file --------------------------------------------------------------
+
+    /// A Config that touches nothing but `dir`. The repository is never
+    /// contacted by the tests that use it.
+    fn test_config(dir: &Path) -> Config {
+        Config {
+            home: dir.display().to_string(),
+            repo: dir.join("repo").display().to_string(),
+            password_command: "true".to_string(),
+            exclude_file: dir.join("excludes").display().to_string(),
+            replica_repos: Vec::new(),
+            retention: Retention { daily: 7, weekly: 4, monthly: 12, yearly: 3 },
+            verification: Verification { enable: true, sample_size: 300 },
+            log_dir: dir.display().to_string(),
+            log_retention_days: default_log_retention_days(),
+            status_file: String::new(),
+            restic_bin: "restic".to_string(),
+            extra_backup_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn status_round_trips_and_carries_last_ok_forward() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = Logger::create(dir.path()).unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.status_file = dir.path().join("state").join("status.json").display().to_string();
+
+        assert!(read_status(&cfg).is_none(), "no status before the first run");
+
+        let then = chrono::Local::now();
+        let mut status = Status {
+            schema: 1,
+            state: "finished".to_string(),
+            started_at: then.format("%Y-%m-%d %H:%M:%S %z").to_string(),
+            started_unix: then.timestamp(),
+            finished_at: None,
+            finished_unix: None,
+            repo: cfg.repo.clone(),
+            replica_repos: Vec::new(),
+            backup: HalfStatus::running(None),
+            recovery: HalfStatus::running(None),
+        };
+        status.backup.finish("ok", then);
+        status.recovery.finish("ok", then);
+        write_status(&cfg, &log, &status);
+
+        let back = read_status(&cfg).expect("status was written");
+        assert_eq!(back.backup.status, "ok");
+        assert_eq!(back.recovery.last_ok_unix, Some(then.timestamp()));
+
+        // A later run that fails keeps the previous success timestamp: the
+        // question a monitor asks is "how long since this last worked?".
+        let mut next = HalfStatus::running(Some(&back.recovery));
+        next.finish("failed", chrono::Local::now());
+        assert_eq!(next.status, "failed");
+        assert_eq!(next.last_ok_unix, Some(then.timestamp()));
+    }
+
+    #[test]
+    fn only_timestamped_run_artifacts_are_prunable() {
+        assert!(is_run_artifact("backup-home-2026-08-31_150002.log"));
+        assert!(is_run_artifact("backup-home-2026-08-31_150002-replica-1.json"));
+        // launchd holds these open and appends to them forever.
+        assert!(!is_run_artifact("backup-home-launchd.stdout.log"));
+        assert!(!is_run_artifact("backup-home-launchd.stderr.log"));
+        assert!(!is_run_artifact("codex-update.log"));
+    }
+
+    #[test]
+    fn prune_logs_keeps_recent_and_current_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = Logger::create(dir.path()).unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.log_retention_days = 30;
+
+        let old = dir.path().join("backup-home-2020-01-01_000000.log");
+        let old_manifest = dir.path().join("backup-home-2020-01-01_000000-replica-1.json");
+        let launchd = dir.path().join("backup-home-launchd.stdout.log");
+        let fresh = dir.path().join("backup-home-2999-01-01_000000.log");
+        for p in [&old, &old_manifest, &launchd, &fresh] {
+            fs::write(p, b"x").unwrap();
+        }
+        let ancient = SystemTime::now() - Duration::from_secs(400 * 24 * 60 * 60);
+        for p in [&old, &old_manifest, &launchd] {
+            let f = fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(ancient).unwrap();
+        }
+
+        prune_logs(&cfg, &log);
+
+        assert!(!old.exists(), "an old run log is removed");
+        assert!(!old_manifest.exists(), "an old manifest is removed");
+        assert!(launchd.exists(), "the launchd log is never removed");
+        assert!(fresh.exists(), "a recent run log is kept");
+        assert!(log.log_path.exists(), "this run's own log is kept");
+    }
+
+    #[test]
+    fn prune_logs_disabled_by_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = Logger::create(dir.path()).unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.log_retention_days = 0;
+
+        let old = dir.path().join("backup-home-2020-01-01_000000.log");
+        fs::write(&old, b"x").unwrap();
+        let f = fs::File::options().write(true).open(&old).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(400 * 24 * 60 * 60)).unwrap();
+
+        prune_logs(&cfg, &log);
+        assert!(old.exists(), "retention 0 keeps everything");
     }
 
     // -- password command splitting -----------------------------------------------
@@ -1319,6 +1810,8 @@ mod tests {
             retention: Retention { daily: 7, weekly: 4, monthly: 12, yearly: 3 },
             verification: Verification { enable: true, sample_size },
             log_dir: log_dir.to_string_lossy().into_owned(),
+            log_retention_days: default_log_retention_days(),
+            status_file: root.path().join("status.json").to_string_lossy().into_owned(),
             restic_bin: "restic".to_string(),
             extra_backup_args: Vec::new(),
         };
@@ -1414,9 +1907,19 @@ mod tests {
         let failures = run(&cfg, &log)?;
         assert!(!failures.is_empty(), "corruption must surface as a nonzero result");
         assert!(
-            failures.iter().any(|f| f.contains("pre-backup")),
+            failures.recovery.iter().any(|f| f.contains("pre-backup")),
             "expected a pre-backup retrieval failure: {failures:?}"
         );
+        // A corrupt pack breaks reading, not writing: the snapshot still
+        // saved, so only the recovery half is red.
+        assert!(
+            failures.backup.is_empty(),
+            "the backup half stays clean when only retrieval fails: {failures:?}"
+        );
+        let status = read_status(&cfg).expect("a status file is written");
+        assert_eq!(status.state, "finished");
+        assert_eq!(status.recovery.status, "failed");
+        assert_eq!(status.backup.status, "ok");
         let after = snapshots(&cfg, &log, &cfg.repo)?;
         assert!(
             after.len() > before,
