@@ -201,7 +201,7 @@ let
     pkgs.stdenv.cc.bintools
     pkgs.restic
     pkgs.rclone
-    pkgs.openssh
+    cfg.sshPackage
     pkgs.gnupg
     pkgs.coreutils
     pkgs.bash
@@ -390,15 +390,41 @@ in
       '';
     };
 
+    sshPackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.openssh;
+      defaultText = lib.literalExpression "pkgs.openssh";
+      example = lib.literalExpression "pkgs.openssh_gssapi";
+      description = ''
+        The `ssh` used by `sftp:` repositories. The default nixpkgs build
+        omits GSSAPI, and prints
+
+        ```text
+        <file> line N: Unsupported option "gssapiauthentication"
+        ```
+
+        on every connection if anything in the user's `~/.ssh/config` — an
+        `Include` of a Lima/colima-generated file, typically — sets
+        `GSSAPIAuthentication`. ssh parses included files whether or not
+        their `Host` matches, and `IgnoreUnknown` does not cover *supported
+        but not compiled in*, so the warning cannot be suppressed from the
+        config side. It lands in restic's stderr and then in the run log,
+        directly in front of the real error text. `pkgs.openssh_gssapi`
+        understands the option and says nothing.
+      '';
+    };
+
     extraRuntimeInputs = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
       example = lib.literalExpression "[ pkgs.age pkgs.passveil ]";
       description = ''
-        Extra packages prepended to the program's pinned PATH. Useful
+        Extra packages appended to the program's pinned PATH. Useful
         when the configured `passwordCommand` needs tools beyond the
-        default set (restic, rclone, openssh, coreutils, gnupg, and the
-        rust-script toolchain).
+        default set (restic, rclone, ssh, coreutils, gnupg, and the
+        rust-script toolchain). To *replace* one of those defaults, use
+        the option for it — `sshPackage`, say — since these come after
+        them on PATH.
       '';
     };
 
