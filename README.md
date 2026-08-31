@@ -109,6 +109,7 @@ and in `statusFile`:
   "schema": 1,
   "state": "finished",
   "started_at": "2026-08-31 15:00:02 +0100",
+  "heartbeat_at": null,
   "backup":   { "status": "ok", "snapshot": "093147cd", "last_ok_unix": 1756652904 },
   "recovery": { "status": "ok", "checks_ok": 4, "checks_failed": 0,
                 "files_verified": 1200, "last_ok_unix": 1756652904 }
@@ -120,6 +121,14 @@ but nothing could be checked — a first run, say) or `disabled`. `last_ok_*` is
 carried forward across runs that did not succeed, so a monitor can answer "how
 long since this last actually worked?" rather than only "did today's run
 pass?".
+
+While a run is in flight the file is rewritten every 60 seconds with a fresh
+`heartbeat_*`, and both are cleared when the run ends. Without that the
+document would change exactly twice per run, making its mtime the run's
+*start* time — and a replica bootstrap copying hundreds of gigabytes over
+sftp runs for hours while looking identical to a run killed in its first
+minute. With it, "still `running`, last touched minutes ago" means the
+process died.
 
 ## What gets backed up
 

@@ -50,7 +50,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 // Replaced by the Nix module with builtins.toJSON of the module config. The
@@ -816,6 +817,11 @@ struct Status {
     finished_at: Option<String>,
     #[serde(default)]
     finished_unix: Option<i64>,
+    /// Last time the run said it was still alive. See [`Heartbeat`].
+    #[serde(default)]
+    heartbeat_at: Option<String>,
+    #[serde(default)]
+    heartbeat_unix: Option<i64>,
     repo: String,
     #[serde(default)]
     replica_repos: Vec<String>,
@@ -831,29 +837,90 @@ fn read_status(cfg: &Config) -> Option<Status> {
     serde_json::from_str(&text).ok()
 }
 
-/// Rewrite the status file atomically. Never fatal: a monitor going stale
-/// must not be able to fail a backup.
+/// Rewrite the status file atomically, or report why not.
+fn write_status_to(status_file: &str, status: &Status) -> Result<()> {
+    let path = Path::new(status_file);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create status directory {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(status).context("cannot serialize status")?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json.as_bytes())
+        .and_then(|()| fs::rename(&tmp, path))
+        .with_context(|| format!("cannot write status file {}", path.display()))?;
+    Ok(())
+}
+
+/// Never fatal: a monitor going stale must not be able to fail a backup.
 fn write_status(cfg: &Config, log: &Logger, status: &Status) {
     if cfg.status_file.is_empty() {
         return;
     }
-    let path = Path::new(&cfg.status_file);
-    if let Some(parent) = path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            log.line(&format!("warning: cannot create status directory {}: {e}", parent.display()));
-            return;
-        }
+    if let Err(e) = write_status_to(&cfg.status_file, status) {
+        log.line(&format!("warning: {e:#}"));
     }
-    let json = match serde_json::to_string_pretty(status) {
-        Ok(j) => j,
-        Err(e) => {
-            log.line(&format!("warning: cannot serialize status: {e}"));
-            return;
+}
+
+/// How often the status file is rewritten while a run is in flight.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
+
+/// Rewrites the status file on a timer for as long as it is alive.
+///
+/// Without this the document changes exactly twice per run, so its mtime is
+/// the run's *start* time and a monitor cannot tell a slow stage from a dead
+/// process: a replica bootstrap copying hundreds of gigabytes over sftp runs
+/// for hours and looks identical to a run killed in its first minute. With a
+/// heartbeat, "still marked running and last touched minutes ago" means
+/// killed, and a monitor can say so the same day instead of waiting for
+/// tomorrow's run to replace the file.
+///
+/// Dropping it stops the thread and waits for it, so the run's final
+/// `write_status` cannot race a beat: drop before writing.
+struct Heartbeat {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Heartbeat {
+    fn start(cfg: &Config, status: &Status, every: Duration) -> Heartbeat {
+        let stop = Arc::new(AtomicBool::new(false));
+        if cfg.status_file.is_empty() {
+            return Heartbeat { stop, thread: None };
         }
-    };
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = fs::write(&tmp, json.as_bytes() as &[u8]).and_then(|()| fs::rename(&tmp, path)) {
-        log.line(&format!("warning: cannot write status file {}: {e}", path.display()));
+        let status_file = cfg.status_file.clone();
+        let mut beat = status.clone();
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            // Poll the stop flag far more often than we beat, so shutdown is
+            // prompt even with a minute-long interval.
+            const TICK: Duration = Duration::from_millis(200);
+            let mut waited = Duration::ZERO;
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(TICK);
+                waited += TICK;
+                if waited < every {
+                    continue;
+                }
+                waited = Duration::ZERO;
+                let now = chrono::Local::now();
+                beat.heartbeat_at = Some(now.format("%Y-%m-%d %H:%M:%S %z").to_string());
+                beat.heartbeat_unix = Some(now.timestamp());
+                // A failed beat is not worth failing a backup over, and the
+                // logger is not shared with this thread.
+                let _ = write_status_to(&status_file, &beat);
+            }
+        });
+        Heartbeat { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -972,12 +1039,17 @@ fn run(cfg: &Config, log: &Logger) -> Result<Outcome> {
         started_unix: start.timestamp(),
         finished_at: None,
         finished_unix: None,
+        heartbeat_at: None,
+        heartbeat_unix: None,
         repo: cfg.repo.clone(),
         replica_repos: cfg.replica_repos.clone(),
         backup: HalfStatus::running(previous.as_ref().map(|p| &p.backup)),
         recovery: HalfStatus::running(previous.as_ref().map(|p| &p.recovery)),
     };
     write_status(cfg, log, &status);
+    // Alive from here until just before the final write. Dropped on every
+    // exit path, including the `?` bails in preflight below.
+    let heartbeat = Heartbeat::start(cfg, &status, HEARTBEAT_EVERY);
 
     log.line(&format!("=== backup-home started: {} ===", start.format("%Y-%m-%d %H:%M:%S %z")));
     log.line(&format!("    primary repo: {}", cfg.repo));
@@ -1268,9 +1340,12 @@ fn run(cfg: &Config, log: &Logger) -> Result<Outcome> {
         }
     }
 
+    drop(heartbeat);
     status.state = "finished".to_string();
     status.finished_at = Some(end.format("%Y-%m-%d %H:%M:%S %z").to_string());
     status.finished_unix = Some(end.timestamp());
+    status.heartbeat_at = None;
+    status.heartbeat_unix = None;
     status.backup.failures = failures.backup.clone();
     status.backup.finish(backup_status, end);
     status.recovery.checks_ok = checks_ok;
@@ -1639,6 +1714,8 @@ mod tests {
             started_unix: then.timestamp(),
             finished_at: None,
             finished_unix: None,
+            heartbeat_at: None,
+            heartbeat_unix: None,
             repo: cfg.repo.clone(),
             replica_repos: Vec::new(),
             backup: HalfStatus::running(None),
@@ -1658,6 +1735,74 @@ mod tests {
         next.finish("failed", chrono::Local::now());
         assert_eq!(next.status, "failed");
         assert_eq!(next.last_ok_unix, Some(then.timestamp()));
+    }
+
+    #[test]
+    fn heartbeat_keeps_the_status_file_fresh_then_stops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = Logger::create(dir.path()).unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.status_file = dir.path().join("status.json").display().to_string();
+
+        let now = chrono::Local::now();
+        let status = Status {
+            schema: 1,
+            state: "running".to_string(),
+            started_at: now.format("%Y-%m-%d %H:%M:%S %z").to_string(),
+            started_unix: now.timestamp(),
+            finished_at: None,
+            finished_unix: None,
+            heartbeat_at: None,
+            heartbeat_unix: None,
+            repo: cfg.repo.clone(),
+            replica_repos: Vec::new(),
+            backup: HalfStatus::running(None),
+            recovery: HalfStatus::running(None),
+        };
+        write_status(&cfg, &log, &status);
+        assert!(read_status(&cfg).unwrap().heartbeat_unix.is_none());
+
+        let heartbeat = Heartbeat::start(&cfg, &status, Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(400));
+        let beating = read_status(&cfg).expect("status still readable while beating");
+        assert!(beating.heartbeat_unix.is_some(), "the run reports itself alive");
+        assert_eq!(beating.state, "running");
+
+        // Dropping joins the thread, so the verdict written afterwards can
+        // never be clobbered by a beat still in flight.
+        drop(heartbeat);
+        let mut final_status = read_status(&cfg).unwrap();
+        final_status.state = "finished".to_string();
+        final_status.heartbeat_unix = None;
+        final_status.heartbeat_at = None;
+        write_status(&cfg, &log, &final_status);
+        std::thread::sleep(Duration::from_millis(200));
+        let after = read_status(&cfg).unwrap();
+        assert_eq!(after.state, "finished", "no beat survives the drop");
+        assert!(after.heartbeat_unix.is_none());
+    }
+
+    #[test]
+    fn heartbeat_is_a_no_op_without_a_status_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        assert!(cfg.status_file.is_empty());
+        let now = chrono::Local::now();
+        let status = Status {
+            schema: 1,
+            state: "running".to_string(),
+            started_at: now.format("%Y-%m-%d %H:%M:%S %z").to_string(),
+            started_unix: now.timestamp(),
+            finished_at: None,
+            finished_unix: None,
+            heartbeat_at: None,
+            heartbeat_unix: None,
+            repo: cfg.repo.clone(),
+            replica_repos: Vec::new(),
+            backup: HalfStatus::running(None),
+            recovery: HalfStatus::running(None),
+        };
+        drop(Heartbeat::start(&cfg, &status, Duration::from_millis(10)));
     }
 
     #[test]
