@@ -37,6 +37,13 @@ let
   homeDir = config.home.homeDirectory;
   logDir = "${homeDir}/.local/log";
 
+  # nixpkgs' restic is a binary wrapper that *prefixes* its own openssh and
+  # rclone onto PATH. Whatever we put on this program's PATH therefore loses
+  # to restic's own copy for every `sftp:` connection, so `sshPackage` only
+  # means anything if it is threaded into restic itself. Overriding with the
+  # default openssh is a no-op and yields the same store path.
+  restic = pkgs.restic.override { openssh = cfg.sshPackage; };
+
   excludeFile = pkgs.writeText "restic-home-excludes" (''
     # macOS junk
     ${homeDir}/.Trash
@@ -199,7 +206,7 @@ let
     pkgs.rustc
     pkgs.stdenv.cc
     pkgs.stdenv.cc.bintools
-    pkgs.restic
+    restic
     pkgs.rclone
     cfg.sshPackage
     pkgs.gnupg
@@ -223,7 +230,7 @@ let
     log_dir = logDir;
     log_retention_days = cfg.logRetentionDays;
     status_file = cfg.statusFile;
-    restic_bin = "${pkgs.restic}/bin/restic";
+    restic_bin = "${restic}/bin/restic";
   };
 
   # The operational program: generic rust-script source with one embedded
@@ -396,8 +403,12 @@ in
       defaultText = lib.literalExpression "pkgs.openssh";
       example = lib.literalExpression "pkgs.openssh_gssapi";
       description = ''
-        The `ssh` used by `sftp:` repositories. The default nixpkgs build
-        omits GSSAPI, and prints
+        The `ssh` used by `sftp:` repositories. Threaded into restic with
+        `restic.override`, not merely put on PATH: nixpkgs' restic is a
+        binary wrapper that prefixes its own openssh, which would otherwise
+        win every time.
+
+        The default nixpkgs build omits GSSAPI, and prints
 
         ```text
         <file> line N: Unsupported option "gssapiauthentication"
@@ -501,7 +512,7 @@ in
 
       home.packages = [
         pkgs.rclone
-        pkgs.restic
+        restic
         backupHome
       ];
     }
